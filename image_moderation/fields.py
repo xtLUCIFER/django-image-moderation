@@ -2,12 +2,12 @@
 Model fields for image moderation
 """
 import boto3
-
-from django.apps import AppConfig
+from django.db import models
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import models
 from django.utils.translation import gettext_lazy as _
+from userprofile.models import ExplicitContent 
+
 
 _moderation_levels = {
     0: [],
@@ -105,7 +105,27 @@ class ImageModerationField(models.ImageField):
         return is_appropiate
 
     def validate(self, value, model_instance, **kwargs):
-        is_appropiate = self.moderate_image(value)
+        is_appropiate, moderation_result = self.moderate_image(value)
+
         if not is_appropiate:
+            user = model_instance.user  # Assuming you have a user field in your model
+            moderation_detailss = moderation_result['moderation_details']
+            
+            # Get the current warning count from the model instance
+            current_warning_count = getattr(model_instance, 'warning_count', 0)
+            warning_count = current_warning_count + 1
+
+            explicit_content = ExplicitContent(
+                user=user,
+                image=value,
+                moderation_details=moderation_detailss,
+                warning_count=warning_count
+            )
+            explicit_content.save()
+
+            # Update the model instance's warning count
+            setattr(model_instance, 'warning_count', warning_count)
+            
             raise ValidationError(self.not_appropiate_text)
+
         super().validate(value, model_instance, **kwargs)
