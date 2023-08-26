@@ -3,10 +3,14 @@ Model fields for image moderation
 """
 import boto3
 from django.db import models
+from django.db.models import F
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
-from userprofile.models import ExplicitContent 
+from django.apps import apps
+from django.http import HttpRequest
+from userprofile.middleware import get_user
+
 
 
 _moderation_levels = {
@@ -54,7 +58,7 @@ class ImageModerationField(models.ImageField):
             moderation_level=4,
             min_confidence=60,
             custom_labels=None,
-            not_appropiate_text=_('This image is not appropiate'),
+            not_appropiate_text=_('The content of this image is not suitable. Uploading such material could have a negative impact on your profile. Repeated violations may lead to permanent profile suspension.'),
             **kwargs,
         ):
         self.moderation_level = moderation_level
@@ -64,12 +68,7 @@ class ImageModerationField(models.ImageField):
         super().__init__(**kwargs)
 
     def moderate_image(self, image):
-        """
-        Function that receives image instance field instance
-        as parameter, moderates the image with AWS's rekognition
-        and returns if is appropiate
-        """
-        is_appropiate = True
+        is_appropriate = True
         moderation_settings = getattr(settings, 'IMAGE_MODERATION')
         access_key = moderation_settings['AWS_ACCESS_KEY']
         secret_key = moderation_settings['AWS_SECRET_KEY']
@@ -87,6 +86,12 @@ class ImageModerationField(models.ImageField):
             }
         )
 
+        print(response)
+
+        moderation_labels = response.get('ModerationLabels', [])
+        moderation_model_version = response.get('ModerationModelVersion', '')
+
+        # Define comparison_labels based on your logic
         if self.custom_labels is not None:
             comparison_labels = self.custom_labels
         else:
@@ -95,37 +100,58 @@ class ImageModerationField(models.ImageField):
                 _moderation_levels[4]
             )
 
-        for label in response['ModerationLabels']:
+        moderation_details = []
+        for label in moderation_labels:
+            label_data = {
+                'Name': label['Name'],
+                'Confidence': label['Confidence'],
+                'ParentName': label['ParentName']
+            }
+            moderation_details.append(label_data)
+
             if (
                 label['Name'] in comparison_labels and
                 label['Confidence'] > self.min_confidence
             ):
-                is_appropiate = False
+                is_appropriate = False
 
-        return is_appropiate
+        result = {
+            'ModerationLabels': moderation_details,
+            'ModerationModelVersion': moderation_model_version
+        }
+
+        return is_appropriate, {'moderation_details': result}
+
+
+
+
+    
 
     def validate(self, value, model_instance, **kwargs):
-        is_appropiate, moderation_result = self.moderate_image(value)
+        
+        is_appropriate, moderation_result = self.moderate_image(value)
 
-        if not is_appropiate:
-            user = model_instance.user  # Assuming you have a user field in your model
-            moderation_detailss = moderation_result['moderation_details']
+
+        if not is_appropriate:
+            userr = get_user()
+            moderation_details = moderation_result['moderation_details']
+            
+            # Get the model class using the apps module
+            explicit_content_model = apps.get_model('userprofile', 'ExplicitContent')
             
             # Get the current warning count from the model instance
             current_warning_count = getattr(model_instance, 'warning_count', 0)
-            warning_count = current_warning_count + 1
-
-            explicit_content = ExplicitContent(
-                user=user,
+            
+            explicit_content = explicit_content_model(
+                user=userr,
                 image=value,
-                moderation_details=moderation_detailss,
-                warning_count=warning_count
+                moderation_lables=moderation_details,
+                warning_count=current_warning_count + 1  
             )
             explicit_content.save()
-
-            # Update the model instance's warning count
-            setattr(model_instance, 'warning_count', warning_count)
             
+            # Raise a ValidationError with a custom error message
             raise ValidationError(self.not_appropiate_text)
-
         super().validate(value, model_instance, **kwargs)
+
+        
